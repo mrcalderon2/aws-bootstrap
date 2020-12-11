@@ -1,0 +1,172 @@
+# main.yml
+
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  EC2InstanceType:
+    Type: String
+  EC2AMI:
+    # This value is a special parameter type that allows this template to get the
+    # latest AMI w/o having to specify the exact version.
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Resources:
+  MySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-sg'
+      GroupDescription: !Sub 'Internal Security group for ${AWS::StackName}'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 108.196.200.189/32
+          Description: "Web app traffic"
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 108.196.200.189/32
+          Description: "SSH access"
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+        - Key: env
+          Value: sandbox
+        - Key: owner
+          Value: miguel.calderon
+
+  MyInstanceRole:
+    # IAM Role to grant the EC2 instance full access to CloudWatch
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - "ec2.amazonaws.com"
+          Action: sts:AssumeRole
+      Description: "Grant full access to CloudWatch"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+        - Key: env
+          Value: sandbox
+        - Key: owner
+          Value: miguel.calderon
+
+  MyInstanceProfile:
+    # Instance profile to tie the above IAM role to the EC2 instance
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - Ref: MyInstanceRole
+
+  MyInstance:
+    # Instance definition
+    Type: "AWS::EC2::Instance"
+    CreationPolicy:
+      # Tells CloudFormation to wait for a signal before marking the new
+      # instance as created
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            # CloudFormation will install these packages on the instance
+            yum:
+              wget: []
+              unzip: []
+    Properties:
+      ImageId: !Ref EC2AMI
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref MyInstanceProfile
+      Monitoring: true
+      SecurityGroupIds:
+        - !GetAtt MySecurityGroup.GroupId
+      KeyName: "miguelc-key"
+      UserData:
+        # UserData allows us to run commands on our instance when it launches
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          echo "Hello! This is a test. Carry on."
+
+          # Send script output to /tmp so we can debug boot failures
+          exec > /tmp/userdata.log 2>&1
+
+          # Update all packages
+          yum -y update
+
+          # Get latest cfn scripts
+          # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/best-practices.html#cfninit
+          yum install -y aws-cfn-bootstrap
+
+          # Have CloudFormation install any files and packages from the metadata
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} \
+                                   --region ${AWS::Region} \
+                                   --resource MyInstance
+
+          # Create install_script.sh
+          cat > /tmp/install_script.sh << EOF
+            # START
+            echo "Setting up Node environment"
+            curl https://raw.githubusercontent.com/nvm-sh/nvm/v0.37.2/install.sh | bash
+
+            # Source the files to ensure that variables are available within the shell
+            . /home/ec2-user/.nvm/nvm.sh
+            . /home/ec2-user/.bashrc
+
+            # Install nvm, npm, and node
+            nvm alias default v15.3.0
+            nvm install v15.3.0
+            nvm use v15.3.0
+
+            # Download latest code, unzip it into /home/ec2-user/app
+            wget https://github.com/mrcalderon2/aws-bootstrap/archive/master.zip
+            unzip master.zip
+            mv aws-bootstrap-master app
+
+            # Set up log directory
+            mkdir /home/ec2-user/app/logs
+            touch /home/ec2-user/app/logs/app.log
+
+            # Run server
+            cd app
+            npm install
+            npm start
+          EOF
+
+          # Have ec2-user run install_script.sh
+          chown ec2-user:ec2-user /tmp/install_script.sh && chmod u+x /tmp/install_script.sh
+          sleep 1; su - ec2-user -c "cd && /tmp/install_script.sh" > /tmp/install_script.log
+
+          # Signal to CloudFormation that the instance is ready
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} \
+                                  --region ${AWS::Region} \
+                                  --resource MyInstance
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+        - Key: env
+          Value: sandbox
+        - Key: owner
+          Value: miguel.calderon
+
+Outputs:
+  MyInstanceHostname:
+    Description: "The hostname for the created instance"
+    Value: !Sub "http://${MyInstance.PublicDnsName}"
+    Export:
+      Name: MyInstanceHostname
+  
+  MyInstanceEndpoint:
+    Description: "The endpoint for the web app running on the created instance"
+    Value: !Sub "http://${MyInstance.PublicDnsName}:8080"
+    Export:
+      Name: MyInstanceEndpoint
